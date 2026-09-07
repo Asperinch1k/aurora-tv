@@ -900,6 +900,12 @@ msgstr "Ping"
 msgid "Latency"
 msgstr "Latência"
 
+msgid "Language"
+msgstr "Idioma"
+
+msgid "Applies as soon as you change it. System Language follows the TV."
+msgstr "Aplica na hora. Idioma do sistema segue a TV."
+
 msgid "Network"
 msgstr "Rede"
 
