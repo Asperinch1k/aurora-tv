@@ -38,11 +38,9 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
-
-      - name: Apply UGREEN raw-input patch
-        run: |
-          git apply --check ugreen-aurora.patch
-          git apply ugreen-aurora.patch
+          
+      - name: Apply UGREEN raw-input modification
+        run: python3 apply_ugreen_mod.py
 
       - name: Download ares-cli-rs
         uses: robinraju/release-downloader@v1.9
