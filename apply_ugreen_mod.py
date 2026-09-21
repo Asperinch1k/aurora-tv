@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Aurora USB + SAS relay v2. Replace the old same-named generator in the fork.
+"""Aurora USB + SAS relay v2.1-mousefix. Replace the old same-named generator in the fork.
 All source anchors are validated before writing. --check does not modify files.
 The Windows helper in the accompanying kit is required for the SAS screen.
 """
@@ -78,7 +78,7 @@ def commit():
                 print(f"ROLLBACK ERROR {rel}: {rollback_error}", file=sys.stderr)
         raise
     for rel in changed: print("updated " + rel)
-    print("Aurora USB + UGREEN + SAS relay v2 applied; Windows SAS helper required.")
+    print("Aurora USB + UGREEN + SAS relay v2.1-mousefix applied; Windows SAS helper required.")
     if not changed: print("Already up to date.")
 
 UGREEN_H = r'''#pragma once
@@ -112,7 +112,9 @@ void ugreen_input_set_session(ugreen_input_t *input, session_t *session);
 '''
 
 UGREEN_C = r'''/* SPDX-License-Identifier: GPL-3.0-or-later
- * Personal Aurora USB input / SAS relay modification, revision 2.
+ * Personal Aurora USB input / SAS relay modification, revision 2.1-mousefix.
+ * Buffered evdev reads, coalescing ONLY already-read complete reports, and
+ * event-driven hotplug. No fixed mouse-rate cap or batching sleep is added.
  * SAS uses a reserved ordinary shortcut; a Windows service supplies SendSAS.
  * No new network listener or host credentials are added to Aurora.
  */
@@ -131,6 +133,7 @@ UGREEN_C = r'''/* SPDX-License-Identifier: GPL-3.0-or-later
 #include <string.h>
 #include <strings.h>
 #include <sys/ioctl.h>
+#include <sys/inotify.h>
 #include <sys/select.h>
 #include <unistd.h>
 #include "logging.h"
@@ -139,7 +142,9 @@ UGREEN_C = r'''/* SPDX-License-Identifier: GPL-3.0-or-later
 
 #define RAW_MAX_DEVICES 32
 #define RAW_MAX_CANDIDATES 64
-#define RAW_SCAN_MS 1000
+#define RAW_SCAN_MS 5000 /* Fallback only when inotify is unavailable. */
+#define RAW_READ_EVENTS 128
+#define RAW_READ_BATCHES 8
 #define BPL (sizeof(unsigned long) * 8)
 #define NBITS(n) (((n) + BPL - 1) / BPL)
 #define RAW_MOUSE 1
@@ -153,7 +158,9 @@ typedef struct {
     unsigned int kind;
     bool known_ugreen, has_mapped_keys, dropped;
     bool held[KEY_MAX + 1], blocked[KEY_MAX + 1];
-    int64_t dx, dy;
+    int64_t dx, dy; /* Incomplete current SYN_REPORT: never batch across it. */
+    int64_t pending_dx, pending_dy; /* Complete reports from the current read. */
+    unsigned int overruns;
 } raw_device_t;
 typedef struct {
     unsigned short keys[KEY_MAX + 1], buttons[6];
@@ -232,6 +239,33 @@ static void send_motion(ugreen_input_t *input, int64_t x, int64_t y) {
     SDL_LockMutex(input->session_lock);
     if (can_send_locked(input, true)) LiSendMouseMoveEvent((short)x, (short)y);
     SDL_UnlockMutex(input->session_lock);
+}
+/* Flushes only reports which already ended with SYN_REPORT. No timer/wait. */
+static void flush_motion(ugreen_input_t *input, raw_state_t *s, raw_device_t *dev) {
+    int64_t x = dev->pending_dx, y = dev->pending_dy;
+    dev->pending_dx = dev->pending_dy = 0;
+    if (!s->sas_latched) send_motion(input, x, y);
+}
+static void queue_report_motion(ugreen_input_t *input, raw_state_t *s, raw_device_t *dev) {
+    int64_t x = dev->dx, y = dev->dy;
+    dev->dx = dev->dy = 0;
+    if (s->sas_latched) {
+        dev->pending_dx = dev->pending_dy = 0;
+        return;
+    }
+    if (!x && !y) return;
+    /* Preserve the old per-report bounds and avoid clipping an accumulated
+       group just because several valid reports together exceed int16. */
+    if (x > 32767 || x < -32768 || y > 32767 || y < -32768) {
+        flush_motion(input, s, dev);
+        send_motion(input, x, y);
+        return;
+    }
+    int64_t sum_x = dev->pending_dx + x, sum_y = dev->pending_dy + y;
+    if (sum_x > 32767 || sum_x < -32768 || sum_y > 32767 || sum_y < -32768)
+        flush_motion(input, s, dev);
+    dev->pending_dx += x;
+    dev->pending_dy += y;
 }
 static void send_scroll(ugreen_input_t *input, int value, bool horizontal) {
     if (!value) return;
@@ -387,6 +421,7 @@ static void clear_physical(raw_state_t *s, raw_device_t *devices, int count) {
     for (int i = 0; i < count; ++i) {
         memset(devices[i].held, 0, sizeof(devices[i].held));
         devices[i].dx = devices[i].dy = 0;
+        devices[i].pending_dx = devices[i].pending_dy = 0;
     }
 }
 static void send_sas_marker(ugreen_input_t *input) {
@@ -466,6 +501,7 @@ static void forget_device(ugreen_input_t *input, raw_state_t *s, raw_device_t *d
         else handle_key(input, s, dev, code, 0);
     }
     dev->dx = dev->dy = 0;
+    dev->pending_dx = dev->pending_dy = 0;
 }
 static void block_held_keys(raw_device_t *dev) {
     unsigned long keys[NBITS(KEY_MAX + 1)] = {0};
@@ -478,6 +514,11 @@ static void process_event(ugreen_input_t *input, raw_state_t *s, raw_device_t *d
     if (ev->type == EV_SYN && ev->code == SYN_DROPPED) {
         forget_device(input, s, dev);
         dev->dropped = true;
+        ++dev->overruns;
+        /* Log only counts 1, 2, 4, 8...; never log every mouse report. */
+        if (dev->overruns && !(dev->overruns & (dev->overruns - 1)))
+            commons_log_warn("USBINPUT", "SYN_DROPPED on %s (%s), total=%u",
+                             dev->path, dev->name, dev->overruns);
         return;
     }
     if (dev->dropped) {
@@ -488,6 +529,9 @@ static void process_event(ugreen_input_t *input, raw_state_t *s, raw_device_t *d
         return;
     }
     if (ev->type == EV_KEY && ev->code <= KEY_MAX) {
+        /* Preserve ordering: earlier completed movement precedes the click
+           or keyboard transition. Do not delay buttons until batch end. */
+        flush_motion(input, s, dev);
         if (mouse_button(ev->code) && (dev->kind & RAW_MOUSE))
             handle_button(input, s, dev, ev->code, ev->value);
         else if (dev->kind & (RAW_KEYBOARD | RAW_AUX))
@@ -495,12 +539,18 @@ static void process_event(ugreen_input_t *input, raw_state_t *s, raw_device_t *d
     } else if (ev->type == EV_REL && (dev->kind & RAW_MOUSE) && !s->sas_latched) {
         if (ev->code == REL_X) dev->dx += ev->value;
         else if (ev->code == REL_Y) dev->dy += ev->value;
-        else if (ev->code == REL_WHEEL) send_scroll(input, ev->value, false);
-        else if (ev->code == REL_HWHEEL) send_scroll(input, ev->value, true);
+        else if (ev->code == REL_WHEEL || ev->code == REL_HWHEEL) {
+            flush_motion(input, s, dev);
+            send_scroll(input, ev->value, ev->code == REL_HWHEEL);
+        }
     } else if (ev->type == EV_SYN && ev->code == SYN_REPORT) {
-        if (!s->sas_latched) send_motion(input, dev->dx, dev->dy);
-        dev->dx = dev->dy = 0;
+        queue_report_motion(input, s, dev);
     }
+}
+static void process_event_batch(ugreen_input_t *input, raw_state_t *s, raw_device_t *dev,
+                                const struct input_event *events, size_t count) {
+    for (size_t i = 0; i < count; ++i) process_event(input, s, dev, &events[i]);
+    flush_motion(input, s, dev);
 }
 /* This function is also covered by the host-side capability unit tests. */
 static unsigned int classify_bits(const unsigned long *evbits,
@@ -608,6 +658,48 @@ static void close_devices(raw_device_t *devices, int count) {
     }
     if (count) commons_log_info("USBINPUT", "Exclusive USB input released");
 }
+/* Notification masks deliberately exclude OPEN/CLOSE: our own scans must
+   not trigger another scan. Most Linux/webOS kernels expose this API. */
+static int start_device_watch(const char *path) {
+    int fd = inotify_init();
+    if (fd < 0) return -1;
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (fd >= FD_SETSIZE || flags < 0 ||
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 ||
+        fcntl(fd, F_SETFD, FD_CLOEXEC) < 0 ||
+        inotify_add_watch(fd, path, IN_CREATE | IN_DELETE | IN_MOVED_FROM |
+                         IN_MOVED_TO | IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+static bool device_watch_changed(int *watch_fd) {
+    union { struct inotify_event align; char bytes[4096]; } buffer;
+    bool changed = false;
+    bool invalidated = false;
+    /* Bounded, even if many devices arrive at once. */
+    for (int batch = 0; batch < 8; ++batch) {
+        ssize_t n = read(*watch_fd, buffer.bytes, sizeof(buffer.bytes));
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+        if (n <= 0) { invalidated = true; break; }
+        for (size_t at = 0; at + sizeof(struct inotify_event) <= (size_t)n;) {
+            const struct inotify_event *event = (const void *)(buffer.bytes + at);
+            size_t size = sizeof(*event) + (size_t)event->len;
+            if (size > (size_t)n - at) { changed = true; break; }
+            if (event->mask & (IN_Q_OVERFLOW | IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED))
+                changed = true;
+            if (event->mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED))
+                invalidated = true;
+            if (event->len >= 6 && memcmp(event->name, "event", 5) == 0 &&
+                event->name[5] >= '0' && event->name[5] <= '9') changed = true;
+            at += size;
+        }
+    }
+    if (invalidated) { close(*watch_fd); *watch_fd = -1; }
+    return changed || invalidated;
+}
 static int raw_thread(void *opaque) {
     ugreen_input_t *input = opaque;
     raw_device_t *devices = calloc(RAW_MAX_DEVICES, sizeof(*devices));
@@ -618,7 +710,12 @@ static int raw_thread(void *opaque) {
     raw_state_t state;
     memset(&state, 0, sizeof(state));
     int count = 0;
-    Uint32 last_scan = SDL_GetTicks() - RAW_SCAN_MS;
+    int watch_fd = start_device_watch("/dev/input");
+    bool rescan = true;
+    Uint32 last_scan = SDL_GetTicks();
+    if (watch_fd < 0)
+        commons_log_warn("USBINPUT", "inotify unavailable: fallback USB scan every %u ms",
+                         (unsigned int)RAW_SCAN_MS);
     while (SDL_AtomicGet(&input->running)) {
         if (!SDL_AtomicGet(&input->active)) {
             release_all(input, &state);
@@ -626,7 +723,7 @@ static int raw_thread(void *opaque) {
             close_devices(devices, count);
             count = 0;
             state.was_accepting = false;
-            last_scan = SDL_GetTicks() - RAW_SCAN_MS;
+            rescan = true;
             SDL_Delay(50);
             continue;
         }
@@ -643,18 +740,22 @@ static int raw_thread(void *opaque) {
         }
         state.was_accepting = accepting;
         Uint32 now = SDL_GetTicks();
-        if ((Uint32)(now - last_scan) >= RAW_SCAN_MS) {
+        if (rescan || (watch_fd < 0 && (Uint32)(now - last_scan) >= RAW_SCAN_MS)) {
+            /* No recurring directory scan while a working watch is present. */
+            if (watch_fd < 0) watch_fd = start_device_watch("/dev/input");
             count = scan_devices(devices, count);
-            last_scan = now;
+            last_scan = SDL_GetTicks();
+            rescan = false;
         }
-        if (!count) { SDL_Delay(50); continue; }
         fd_set fds;
         FD_ZERO(&fds);
         int maxfd = -1;
+        if (watch_fd >= 0) { FD_SET(watch_fd, &fds); maxfd = watch_fd; }
         for (int i = 0; i < count; ++i) {
             FD_SET(devices[i].fd, &fds);
             if (devices[i].fd > maxfd) maxfd = devices[i].fd;
         }
+        /* select wakes as soon as input arrives; 20 ms is NOT a mouse delay. */
         struct timeval timeout = {0, 20000};
         int ready = select(maxfd + 1, &fds, NULL, NULL, &timeout);
         if (ready < 0 && errno == EINTR) continue;
@@ -663,16 +764,25 @@ static int raw_thread(void *opaque) {
             clear_physical(&state, devices, count);
             close_devices(devices, count);
             count = 0;
+            rescan = true;
+            if (watch_fd >= 0) { close(watch_fd); watch_fd = -1; }
+            SDL_Delay(10); /* Error backoff only, not the normal input path. */
             continue;
         }
+        if (ready == 0) continue;
+        /* Drain active input first; only scan on the next iteration. */
         for (int i = 0; i < count;) {
             raw_device_t *dev = &devices[i];
             if (!FD_ISSET(dev->fd, &fds)) { ++i; continue; }
             bool gone = false;
-            for (int budget = 0; budget < 512; ++budget) {
-                struct input_event ev;
-                ssize_t bytes = read(dev->fd, &ev, sizeof(ev));
-                if (bytes == (ssize_t)sizeof(ev)) { process_event(input, &state, dev, &ev); continue; }
+            for (int budget = 0; budget < RAW_READ_BATCHES; ++budget) {
+                struct input_event events[RAW_READ_EVENTS];
+                ssize_t bytes = read(dev->fd, events, sizeof(events));
+                if (bytes > 0 && bytes % (ssize_t)sizeof(events[0]) == 0) {
+                    process_event_batch(input, &state, dev, events,
+                                        (size_t)bytes / sizeof(events[0]));
+                    continue;
+                }
                 if (bytes < 0 && errno == EINTR) continue;
                 if (bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
                 gone = true;
@@ -684,11 +794,14 @@ static int raw_thread(void *opaque) {
             close(dev->fd);
             commons_log_info("USBINPUT", "Disconnected %s", dev->path);
             devices[i] = devices[--count];
-            last_scan = SDL_GetTicks() - RAW_SCAN_MS;
+            rescan = true;
         }
+        if (watch_fd >= 0 && FD_ISSET(watch_fd, &fds))
+            rescan = device_watch_changed(&watch_fd) || rescan;
     }
     release_all(input, &state);
     close_devices(devices, count);
+    if (watch_fd >= 0) close(watch_fd);
     free(devices);
     return 0;
 }
@@ -706,7 +819,7 @@ int ugreen_input_init(ugreen_input_t *input, app_t *app) {
         input->session_lock = NULL;
         return -1;
     }
-    commons_log_info("USBINPUT", "USB + UGREEN raw-input v2 started; SAS relay enabled");
+    commons_log_info("USBINPUT", "USB + UGREEN raw-input v2.1-mousefix started; buffered reads + inotify; SAS relay enabled");
     return 0;
 }
 void ugreen_input_deinit(ugreen_input_t *input) {
