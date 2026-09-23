@@ -78,7 +78,7 @@ def commit():
                 print(f"ROLLBACK ERROR {rel}: {rollback_error}", file=sys.stderr)
         raise
     for rel in changed: print("updated " + rel)
-    print("Aurora USB + UGREEN + SAS relay v2.1-mousefix applied; Windows SAS helper required.")
+    print("Aurora USB + UGREEN + SAS relay v2.2-inputfix applied; Windows SAS helper required.")
     if not changed: print("Already up to date.")
 
 UGREEN_H = r'''#pragma once
@@ -112,9 +112,10 @@ void ugreen_input_set_session(ugreen_input_t *input, session_t *session);
 '''
 
 UGREEN_C = r'''/* SPDX-License-Identifier: GPL-3.0-or-later
- * Personal Aurora USB input / SAS relay modification, revision 2.1-mousefix.
- * Buffered evdev reads, coalescing ONLY already-read complete reports, and
- * event-driven hotplug. No fixed mouse-rate cap or batching sleep is added.
+ * Personal Aurora USB input / SAS relay modification, revision 2.2-inputfix.
+ * Event-driven hotplug is retained. Mouse movement is forwarded on every
+ * EV_SYN/SYN_REPORT like the older smooth UGREEN implementation. Reads are
+ * deliberately small and fair so a high-polling mouse cannot starve keyboard.
  * SAS uses a reserved ordinary shortcut; a Windows service supplies SendSAS.
  * No new network listener or host credentials are added to Aurora.
  */
@@ -143,8 +144,8 @@ UGREEN_C = r'''/* SPDX-License-Identifier: GPL-3.0-or-later
 #define RAW_MAX_DEVICES 32
 #define RAW_MAX_CANDIDATES 64
 #define RAW_SCAN_MS 5000 /* Fallback only when inotify is unavailable. */
-#define RAW_READ_EVENTS 128
-#define RAW_READ_BATCHES 8
+#define RAW_READ_EVENTS 32
+#define RAW_READ_BATCHES 1
 #define BPL (sizeof(unsigned long) * 8)
 #define NBITS(n) (((n) + BPL - 1) / BPL)
 #define RAW_MOUSE 1
@@ -158,8 +159,7 @@ typedef struct {
     unsigned int kind;
     bool known_ugreen, has_mapped_keys, dropped;
     bool held[KEY_MAX + 1], blocked[KEY_MAX + 1];
-    int64_t dx, dy; /* Incomplete current SYN_REPORT: never batch across it. */
-    int64_t pending_dx, pending_dy; /* Complete reports from the current read. */
+    int64_t dx, dy; /* Movement accumulated only until the next SYN_REPORT. */
     unsigned int overruns;
 } raw_device_t;
 typedef struct {
@@ -240,32 +240,11 @@ static void send_motion(ugreen_input_t *input, int64_t x, int64_t y) {
     if (can_send_locked(input, true)) LiSendMouseMoveEvent((short)x, (short)y);
     SDL_UnlockMutex(input->session_lock);
 }
-/* Flushes only reports which already ended with SYN_REPORT. No timer/wait. */
-static void flush_motion(ugreen_input_t *input, raw_state_t *s, raw_device_t *dev) {
-    int64_t x = dev->pending_dx, y = dev->pending_dy;
-    dev->pending_dx = dev->pending_dy = 0;
-    if (!s->sas_latched) send_motion(input, x, y);
-}
-static void queue_report_motion(ugreen_input_t *input, raw_state_t *s, raw_device_t *dev) {
+/* Preserve the old smooth path: forward every completed evdev report. */
+static void send_report_motion(ugreen_input_t *input, raw_state_t *s, raw_device_t *dev) {
     int64_t x = dev->dx, y = dev->dy;
     dev->dx = dev->dy = 0;
-    if (s->sas_latched) {
-        dev->pending_dx = dev->pending_dy = 0;
-        return;
-    }
-    if (!x && !y) return;
-    /* Preserve the old per-report bounds and avoid clipping an accumulated
-       group just because several valid reports together exceed int16. */
-    if (x > 32767 || x < -32768 || y > 32767 || y < -32768) {
-        flush_motion(input, s, dev);
-        send_motion(input, x, y);
-        return;
-    }
-    int64_t sum_x = dev->pending_dx + x, sum_y = dev->pending_dy + y;
-    if (sum_x > 32767 || sum_x < -32768 || sum_y > 32767 || sum_y < -32768)
-        flush_motion(input, s, dev);
-    dev->pending_dx += x;
-    dev->pending_dy += y;
+    if (!s->sas_latched) send_motion(input, x, y);
 }
 static void send_scroll(ugreen_input_t *input, int value, bool horizontal) {
     if (!value) return;
@@ -421,7 +400,6 @@ static void clear_physical(raw_state_t *s, raw_device_t *devices, int count) {
     for (int i = 0; i < count; ++i) {
         memset(devices[i].held, 0, sizeof(devices[i].held));
         devices[i].dx = devices[i].dy = 0;
-        devices[i].pending_dx = devices[i].pending_dy = 0;
     }
 }
 static void send_sas_marker(ugreen_input_t *input) {
@@ -501,7 +479,6 @@ static void forget_device(ugreen_input_t *input, raw_state_t *s, raw_device_t *d
         else handle_key(input, s, dev, code, 0);
     }
     dev->dx = dev->dy = 0;
-    dev->pending_dx = dev->pending_dy = 0;
 }
 static void block_held_keys(raw_device_t *dev) {
     unsigned long keys[NBITS(KEY_MAX + 1)] = {0};
@@ -529,9 +506,6 @@ static void process_event(ugreen_input_t *input, raw_state_t *s, raw_device_t *d
         return;
     }
     if (ev->type == EV_KEY && ev->code <= KEY_MAX) {
-        /* Preserve ordering: earlier completed movement precedes the click
-           or keyboard transition. Do not delay buttons until batch end. */
-        flush_motion(input, s, dev);
         if (mouse_button(ev->code) && (dev->kind & RAW_MOUSE))
             handle_button(input, s, dev, ev->code, ev->value);
         else if (dev->kind & (RAW_KEYBOARD | RAW_AUX))
@@ -539,18 +513,15 @@ static void process_event(ugreen_input_t *input, raw_state_t *s, raw_device_t *d
     } else if (ev->type == EV_REL && (dev->kind & RAW_MOUSE) && !s->sas_latched) {
         if (ev->code == REL_X) dev->dx += ev->value;
         else if (ev->code == REL_Y) dev->dy += ev->value;
-        else if (ev->code == REL_WHEEL || ev->code == REL_HWHEEL) {
-            flush_motion(input, s, dev);
-            send_scroll(input, ev->value, ev->code == REL_HWHEEL);
-        }
+        else if (ev->code == REL_WHEEL) send_scroll(input, ev->value, false);
+        else if (ev->code == REL_HWHEEL) send_scroll(input, ev->value, true);
     } else if (ev->type == EV_SYN && ev->code == SYN_REPORT) {
-        queue_report_motion(input, s, dev);
+        send_report_motion(input, s, dev);
     }
 }
 static void process_event_batch(ugreen_input_t *input, raw_state_t *s, raw_device_t *dev,
                                 const struct input_event *events, size_t count) {
     for (size_t i = 0; i < count; ++i) process_event(input, s, dev, &events[i]);
-    flush_motion(input, s, dev);
 }
 /* This function is also covered by the host-side capability unit tests. */
 static unsigned int classify_bits(const unsigned long *evbits,
@@ -819,7 +790,7 @@ int ugreen_input_init(ugreen_input_t *input, app_t *app) {
         input->session_lock = NULL;
         return -1;
     }
-    commons_log_info("USBINPUT", "USB + UGREEN raw-input v2.1-mousefix started; buffered reads + inotify; SAS relay enabled");
+    commons_log_info("USBINPUT", "USB + UGREEN raw-input v2.2-inputfix started; per-report mouse + fair reads + inotify; SAS relay enabled");
     return 0;
 }
 void ugreen_input_deinit(ugreen_input_t *input) {
