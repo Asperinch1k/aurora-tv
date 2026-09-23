@@ -78,7 +78,7 @@ def commit():
                 print(f"ROLLBACK ERROR {rel}: {rollback_error}", file=sys.stderr)
         raise
     for rel in changed: print("updated " + rel)
-    print("Aurora USB + UGREEN + SAS relay v2.2-inputfix applied; Windows SAS helper required.")
+    print("Aurora USB + UGREEN + SAS relay v2.3-wheelfix applied; Windows SAS helper required.")
     if not changed: print("Already up to date.")
 
 UGREEN_H = r'''#pragma once
@@ -160,6 +160,8 @@ typedef struct {
     bool known_ugreen, has_mapped_keys, dropped;
     bool held[KEY_MAX + 1], blocked[KEY_MAX + 1];
     int64_t dx, dy; /* Movement accumulated only until the next SYN_REPORT. */
+    int64_t wheel, hwheel; /* Legacy wheel clicks for this evdev report. */
+    int64_t wheel_hi, hwheel_hi; /* Linux hi-res wheel units: 120 = one detent. */
     unsigned int overruns;
 } raw_device_t;
 typedef struct {
@@ -246,7 +248,7 @@ static void send_report_motion(ugreen_input_t *input, raw_state_t *s, raw_device
     dev->dx = dev->dy = 0;
     if (!s->sas_latched) send_motion(input, x, y);
 }
-static void send_scroll(ugreen_input_t *input, int value, bool horizontal) {
+static void send_scroll(ugreen_input_t *input, int64_t value, bool horizontal) {
     if (!value) return;
     if (value > 127) value = 127;
     if (value < -127) value = -127;
@@ -256,6 +258,38 @@ static void send_scroll(ugreen_input_t *input, int value, bool horizontal) {
         else LiSendScrollEvent((signed char)value);
     }
     SDL_UnlockMutex(input->session_lock);
+}
+static void send_hires_scroll(ugreen_input_t *input, int64_t value, bool horizontal) {
+    if (!value) return;
+    /* Limelight high-resolution wheel units match Linux evdev semantics:
+       120 units correspond to one traditional wheel detent. */
+    while (value) {
+        int chunk;
+        if (value > 32767) chunk = 32767;
+        else if (value < -32768) chunk = -32768;
+        else chunk = (int)value;
+        SDL_LockMutex(input->session_lock);
+        if (can_send_locked(input, true)) {
+            if (horizontal) LiSendHighResHScrollEvent((short)chunk);
+            else LiSendHighResScrollEvent((short)chunk);
+        }
+        SDL_UnlockMutex(input->session_lock);
+        value -= chunk;
+    }
+}
+static void send_report_scroll(ugreen_input_t *input, raw_state_t *s, raw_device_t *dev) {
+    if (s->sas_latched) {
+        dev->wheel = dev->hwheel = dev->wheel_hi = dev->hwheel_hi = 0;
+        return;
+    }
+    /* A hi-res capable Linux mouse commonly emits BOTH REL_WHEEL and
+       REL_WHEEL_HI_RES for the same physical motion. Prefer hi-res for that
+       report so the host does not receive the wheel movement twice. */
+    if (dev->wheel_hi) send_hires_scroll(input, dev->wheel_hi, false);
+    else if (dev->wheel) send_scroll(input, dev->wheel, false);
+    if (dev->hwheel_hi) send_hires_scroll(input, dev->hwheel_hi, true);
+    else if (dev->hwheel) send_scroll(input, dev->hwheel, true);
+    dev->wheel = dev->hwheel = dev->wheel_hi = dev->hwheel_hi = 0;
 }
 static short linux_key_to_vk(unsigned short code) {
     if (code >= KEY_F1 && code <= KEY_F10) {
@@ -400,6 +434,8 @@ static void clear_physical(raw_state_t *s, raw_device_t *devices, int count) {
     for (int i = 0; i < count; ++i) {
         memset(devices[i].held, 0, sizeof(devices[i].held));
         devices[i].dx = devices[i].dy = 0;
+        devices[i].wheel = devices[i].hwheel = 0;
+        devices[i].wheel_hi = devices[i].hwheel_hi = 0;
     }
 }
 static void send_sas_marker(ugreen_input_t *input) {
@@ -479,6 +515,8 @@ static void forget_device(ugreen_input_t *input, raw_state_t *s, raw_device_t *d
         else handle_key(input, s, dev, code, 0);
     }
     dev->dx = dev->dy = 0;
+    dev->wheel = dev->hwheel = 0;
+    dev->wheel_hi = dev->hwheel_hi = 0;
 }
 static void block_held_keys(raw_device_t *dev) {
     unsigned long keys[NBITS(KEY_MAX + 1)] = {0};
@@ -513,10 +551,18 @@ static void process_event(ugreen_input_t *input, raw_state_t *s, raw_device_t *d
     } else if (ev->type == EV_REL && (dev->kind & RAW_MOUSE) && !s->sas_latched) {
         if (ev->code == REL_X) dev->dx += ev->value;
         else if (ev->code == REL_Y) dev->dy += ev->value;
-        else if (ev->code == REL_WHEEL) send_scroll(input, ev->value, false);
-        else if (ev->code == REL_HWHEEL) send_scroll(input, ev->value, true);
+        else if (ev->code == REL_WHEEL) dev->wheel += ev->value;
+        else if (ev->code == REL_HWHEEL) dev->hwheel += ev->value;
+#ifdef REL_WHEEL_HI_RES
+        else if (ev->code == REL_WHEEL_HI_RES) dev->wheel_hi += ev->value;
+#endif
+#ifdef REL_HWHEEL_HI_RES
+        else if (ev->code == REL_HWHEEL_HI_RES) dev->hwheel_hi += ev->value;
+#endif
     } else if (ev->type == EV_SYN && ev->code == SYN_REPORT) {
+        /* Keep the known-good movement path exactly per evdev report. */
         send_report_motion(input, s, dev);
+        send_report_scroll(input, s, dev);
     }
 }
 static void process_event_batch(ugreen_input_t *input, raw_state_t *s, raw_device_t *dev,
@@ -790,7 +836,7 @@ int ugreen_input_init(ugreen_input_t *input, app_t *app) {
         input->session_lock = NULL;
         return -1;
     }
-    commons_log_info("USBINPUT", "USB + UGREEN raw-input v2.2-inputfix started; per-report mouse + fair reads + inotify; SAS relay enabled");
+    commons_log_info("USBINPUT", "USB + UGREEN raw-input v2.3-wheelfix started; per-report mouse + fair reads + inotify; SAS relay enabled");
     return 0;
 }
 void ugreen_input_deinit(ugreen_input_t *input) {
